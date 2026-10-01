@@ -2,6 +2,7 @@ package nilflow
 
 import (
 	"go/ast"
+	"fmt"
 	"go/token"
 	"go/types"
 
@@ -133,15 +134,14 @@ func (a *intraAnalyzer) evalMulti(e ast.Expr, st *flowState) ([]Val, bool) {
 	case *ast.IndexExpr: // map 索引（也可能是 *array，后者单值）
 		a.eval(n.X, st)
 		a.eval(n.Index, st)
-		// 两个结果：value(未知), ok(未知非nil概念)。
-		return []Val{vUnknown(), vUnknown()}, true
+		return builtinOkVals(n), true
 	case *ast.TypeAssertExpr:
 		a.eval(n.X, st)
-		return []Val{vUnknown(), vUnknown()}, true
+		return builtinOkVals(n), true
 	case *ast.UnaryExpr:
 		if n.Op == token.ARROW { // <-ch
 			a.eval(n.X, st)
-			return []Val{vUnknown(), vUnknown()}, true
+			return builtinOkVals(n), true
 		}
 	case *ast.CallExpr:
 		vals, ok := a.evalCallMulti(n, st)
@@ -150,6 +150,16 @@ func (a *intraAnalyzer) evalMulti(e ast.Expr, st *flowState) ([]Val, bool) {
 		}
 	}
 	return nil, false
+}
+
+// builtinOkVals 为 m[k]/v.(T)/<-ch 的 (value, ok) 二元结果打上
+// 同一次表达式的 CallRef，使 ok 分支精化只作用于同次产生的 value。
+func builtinOkVals(src ast.Expr) []Val {
+	v := vUnknown()
+	v.Call = &CallRef{Expr: src, Idx: 0}
+	ok := vUnknown()
+	ok.Call = &CallRef{Expr: src, Idx: 1}
+	return []Val{v, ok}
 }
 
 // evalCall 处理单值调用，并传播被调函数摘要。
@@ -215,12 +225,46 @@ func (a *intraAnalyzer) evalCallMulti(call *ast.CallExpr, st *flowState) ([]Val,
 		out[i] = vUnknown()
 		if sum != nil && i < len(sum.Results) {
 			v := sum.Results[i]
-			// 标记调用出处，供 error-ok 条件精化。
-			v.Call = &CallRef{Expr: call, Idx: i}
+			// 标记调用出处与被调函数的返回路径，供 error/ok 条件精化。
+			v.Call = &CallRef{Expr: call, Idx: i, Paths: sum.Paths}
 			out[i] = v
+			fmt.Printf("DEBUG out[%d] kind=%v call=%v paths=%d\n", i, v.Kind, v.Call != nil, len(sum.Paths))
+			if r := resultSig(fn, a.info); r != nil && i < r.Len() && isBoolType(r.At(i).Type()) {
+				out[i].Truth = boolResultTruth(sum.Paths)
+			}
 		}
 	}
 	return out, true
+}
+
+// resultSig 返回被调函数的结果签名（缓存意义不大，按需取）。
+func resultSig(fn *types.Func, info *types.Info) *types.Tuple {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok {
+		return nil
+	}
+	return sig.Results()
+}
+
+// boolResultTruth 在被调函数所有返回路径上该布尔结果同为真/假时给出静态真值。
+func boolResultTruth(paths []ReturnPath) Truth {
+	var t Truth
+	for _, p := range paths {
+		var pt Truth
+		// 约定：Paths 仅在单值多值调用上下文使用，Truths 按下标取。
+		if len(p.Truths) > 0 {
+			pt = p.Truths[len(p.Truths)-1]
+		}
+		if pt == TruthUnknown {
+			return TruthUnknown
+		}
+		if t == TruthUnknown {
+			t = pt
+		} else if t != pt {
+			return TruthUnknown
+		}
+	}
+	return t
 }
 
 // checkPtrDeref 根据解引用点的空值状态产出诊断或证据。
@@ -420,4 +464,99 @@ func itoa(i int) string {
 		b[p] = '-'
 	}
 	return string(b[p:])
+}
+
+// truthOf 在给定状态下静态判定布尔表达式的真假性；
+// 无法确定时返回 TruthUnknown。仅识别最常见的成功/失败模式形态。
+func (a *intraAnalyzer) truthOf(e ast.Expr, st *flowState) Truth {
+	switch n := e.(type) {
+	case *ast.ParenExpr:
+		return a.truthOf(n.X, st)
+	case *ast.Ident:
+		if n.Name == "nil" {
+			return TruthUnknown // nil 不是布尔
+		}
+		if n.Name == "true" {
+			return TruthTrue
+		}
+		if n.Name == "false" {
+			return TruthFalse
+		}
+		if obj := a.info.ObjectOf(n); obj != nil {
+			if v, ok := st.vars[objectKey(obj)]; ok {
+				if t := v.Truth; t != TruthUnknown {
+					return t
+				}
+			}
+		}
+	case *ast.UnaryExpr:
+		if n.Op == token.NOT {
+			switch a.truthOf(n.X, st) {
+			case TruthTrue:
+				return TruthFalse
+			case TruthFalse:
+				return TruthTrue
+			}
+		}
+	case *ast.BinaryExpr:
+		return a.truthBinary(n, st)
+	}
+	return TruthUnknown
+}
+
+// truthBinary 判定比较/与或表达式的静态真假。
+func (a *intraAnalyzer) truthBinary(n *ast.BinaryExpr, st *flowState) Truth {
+	switch n.Op {
+	case token.LAND:
+		x, y := a.truthOf(n.X, st), a.truthOf(n.Y, st)
+		if x == TruthFalse || y == TruthFalse {
+			return TruthFalse
+		}
+		if x == TruthTrue && y == TruthTrue {
+			return TruthTrue
+		}
+	case token.LOR:
+		x, y := a.truthOf(n.X, st), a.truthOf(n.Y, st)
+		if x == TruthTrue || y == TruthTrue {
+			return TruthTrue
+		}
+		if x == TruthFalse && y == TruthFalse {
+			return TruthFalse
+		}
+	default:
+		lt, lok := a.literalTruth(n.X)
+		rt, rok := a.literalTruth(n.Y)
+		if !lok || !rok {
+			return TruthUnknown
+		}
+		eq := lt == rt
+		switch n.Op {
+		case token.EQL:
+			return boolTruth(eq)
+		case token.NEQ:
+			return boolTruth(!eq)
+		}
+	}
+	return TruthUnknown
+}
+
+func boolTruth(b bool) Truth {
+	if b {
+		return TruthTrue
+	}
+	return TruthFalse
+}
+
+// literalTruth 把字面量表达式映射为可比较的真值：
+// 布尔字面量取其布尔值，nil 视为假，其余无法比较。
+func (a *intraAnalyzer) literalTruth(e ast.Expr) (Truth, bool) {
+	if id, ok := e.(*ast.Ident); ok {
+		switch id.Name {
+		case "true":
+			return TruthTrue, true
+		case "false", "nil":
+			return TruthFalse, true
+		}
+	}
+	return TruthUnknown, false
 }

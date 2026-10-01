@@ -21,11 +21,33 @@ type Summary struct {
 	Results []Val // 每个返回值的空值抽象
 	// ResultPos 记录每个返回值被判定为 nil/非nil 的代表性 return 位置。
 	ResultPos []token.Pos
+	// Paths 记录每条可达 return 语句上各结果值的元组，
+	// 供调用点按 error/ok 兄弟返回值做路径相关精化。
+	// Results 是 Paths 在全部路径上的保守合并。
+	Paths []ReturnPath
 	// DerefParams 记录函数体内无条件解引用的形参下标（接收者为 0）。
 	DerefParams []int
 	// DerefPos 给出各 DerefParams 解引用点的位置，用于调用路径展示。
 	DerefPos map[int]token.Pos
 	BodyHash string
+}
+
+// Truth 描述一个布尔返回值在某条 return 路径上的真假性。
+type Truth int
+
+const (
+	TruthUnknown Truth = iota
+	TruthTrue
+	TruthFalse
+)
+
+// ReturnPath 是一条 return 语句的抽象：
+// Vals 为各结果的空值格元素（此时 Call 为 nil，调用点会重新关联出处）；
+// Truths 记录布尔结果的真假性，非布尔结果对应 TruthUnknown。
+type ReturnPath struct {
+	Vals   []Val
+	Truths []Truth
+	Pos    token.Pos
 }
 
 // FuncEnv 是分析单个函数时所需的环境。

@@ -34,6 +34,8 @@ type intraAnalyzer struct {
 	// 当前函数结果：各 return 语句抽象值的合并。
 	returnVals []Val
 	hasReturn  bool
+	// returnPaths 按出现顺序记录每条 return 语句的结果元组。
+	returnPaths []ReturnPath
 	// resultOk 记录命名返回值，用于裸 return。
 	resultObjs []*types.Var
 }
@@ -83,17 +85,28 @@ func (a *intraAnalyzer) run() (*Summary, []diag.Diagnostic) {
 	if results == nil {
 		results = []Val{}
 	}
+	paths := a.returnPaths
 	// 无 return 语句的函数：若有返回值，按命名返回值/零值填充。
 	if !a.hasReturn && sig != nil {
 		r := sig.Results()
 		results = make([]Val, r.Len())
+		rp := ReturnPath{}
 		for i := 0; i < r.Len(); i++ {
 			if r.At(i).Name() != "" {
 				results[i] = a.state.vars[objectKey(r.At(i))]
 			} else {
 				results[i] = zeroVal(r.At(i).Type())
 			}
+			v := results[i]
+			v.Call = nil
+			rp.Vals = append(rp.Vals, v)
+			if isBoolType(r.At(i).Type()) {
+				rp.Truths = append(rp.Truths, results[i].Truth)
+			} else {
+				rp.Truths = append(rp.Truths, TruthUnknown)
+			}
 		}
+		paths = append(paths, rp)
 	}
 	var dp []int
 	for i := range a.derefParams {
@@ -102,6 +115,7 @@ func (a *intraAnalyzer) run() (*Summary, []diag.Diagnostic) {
 	sum := &Summary{
 		Func:        a.env.Func,
 		Results:     results,
+		Paths:       paths,
 		DerefParams: dp,
 		DerefPos:    a.derefPos,
 	}
@@ -319,9 +333,12 @@ func (a *intraAnalyzer) walkStmtList(list []ast.Stmt, st *flowState) *flowState 
 func (a *intraAnalyzer) walkReturn(n *ast.ReturnStmt, st *flowState) *flowState {
 	if len(n.Results) == 0 {
 		// 裸 return：取命名返回值当前状态。
+		vals := make([]Val, len(a.resultObjs))
 		for i, v := range a.resultObjs {
-			a.mergeReturn(i, st.vars[objectKey(v)])
+			vals[i] = st.vars[objectKey(v)]
+			a.mergeReturn(i, vals[i])
 		}
+		a.recordReturn(vals, nil, n.Pos(), st)
 		a.hasReturn = true
 		return nil
 	}
@@ -331,15 +348,109 @@ func (a *intraAnalyzer) walkReturn(n *ast.ReturnStmt, st *flowState) *flowState 
 			for i, v := range vals {
 				a.mergeReturn(i, v)
 			}
+			a.recordMultiReturn(vals, n.Results[0], n.Pos(), st)
 			a.hasReturn = true
 			return nil
 		}
 	}
+	vals := make([]Val, len(n.Results))
 	for i, e := range n.Results {
-		a.mergeReturn(i, a.eval(e, st))
+		vals[i] = a.eval(e, st)
+		a.mergeReturn(i, vals[i])
 	}
+	a.recordReturn(vals, n.Results, n.Pos(), st)
 	a.hasReturn = true
 	return nil
+}
+
+// recordMultiReturn 处理单表达式多值返回（f() / m[k] / v.(T) / <-ch）。
+// 函数调用的真假来自被调摘要路径；内置二元形式的 ok 真假无法从表达式本身
+// 得到（语法里没有真假字面量），按未知处理——其值也是 Unknown，不误报。
+func (a *intraAnalyzer) recordMultiReturn(vals []Val, e ast.Expr, pos token.Pos, st *flowState) {
+	sig, _ := a.env.Func.Type().(*types.Signature)
+	if sig == nil {
+		return
+	}
+	r := sig.Results()
+	rp := ReturnPath{Pos: pos}
+	truthByIdx := map[int]Truth{}
+	if call, ok := e.(*ast.CallExpr); ok {
+		if fn := calledFunc(call, a.info); fn != nil && a.resolve != nil {
+			if sum := a.resolve(fn); sum != nil {
+				for _, p := range sum.Paths {
+					for i, t := range p.Truths {
+						if t == TruthUnknown {
+							continue
+						}
+						if cur, exists := truthByIdx[i]; !exists {
+							truthByIdx[i] = t
+						} else if cur != t {
+							truthByIdx[i] = TruthUnknown
+						}
+					}
+				}
+			}
+		}
+	}
+	for i := 0; i < r.Len(); i++ {
+		var v Val
+		if i < len(vals) {
+			v = vals[i]
+		} else {
+			v = zeroVal(r.At(i).Type())
+		}
+		v.Call = nil
+		rp.Vals = append(rp.Vals, v)
+		if isBoolType(r.At(i).Type()) {
+			t := truthByIdx[i]
+			if t == TruthUnknown {
+				t = vals[i].Truth
+			}
+			rp.Truths = append(rp.Truths, t)
+		} else {
+			rp.Truths = append(rp.Truths, TruthUnknown)
+		}
+	}
+	a.returnPaths = append(a.returnPaths, rp)
+}
+
+// recordReturn 保存一条 return 路径的结果空值元组与布尔结果真假性，
+// 供调用点做 (data, error)/(data, ok) 的路径相关精化。
+func (a *intraAnalyzer) recordReturn(vals []Val, exprs []ast.Expr, pos token.Pos, st *flowState) {
+	sig, _ := a.env.Func.Type().(*types.Signature)
+	if sig == nil {
+		return
+	}
+	r := sig.Results()
+	rp := ReturnPath{Pos: pos}
+	for i := 0; i < r.Len(); i++ {
+		var v Val
+		if i < len(vals) {
+			v = vals[i]
+		} else {
+			v = zeroVal(r.At(i).Type())
+		}
+		// 摘要中的值不携带调用出处（出处属于调用点的关联）。
+		v.Call = nil
+		rp.Vals = append(rp.Vals, v)
+		if isBoolType(r.At(i).Type()) {
+			t := TruthUnknown
+			if len(exprs) == 1 {
+				// 多值返回：若被调摘要也带路径信息，truthOf 无法跨调用解析，
+				// 此时保持未知（evalCallMulti 会另行传递，见 branch 精化回退）。
+				t = TruthUnknown
+			} else if i < len(exprs) {
+				t = a.truthOf(exprs[i], st)
+			}
+			if t == TruthUnknown {
+				t = v.Truth
+			}
+			rp.Truths = append(rp.Truths, t)
+		} else {
+			rp.Truths = append(rp.Truths, TruthUnknown)
+		}
+	}
+	a.returnPaths = append(a.returnPaths, rp)
 }
 
 func (a *intraAnalyzer) mergeReturn(i int, v Val) {
@@ -348,6 +459,8 @@ func (a *intraAnalyzer) mergeReturn(i int, v Val) {
 		copy(extended, a.returnVals)
 		a.returnVals = extended
 	}
+	// 摘要层面不保留调用出处：CallRef 是调用点局部的语法关联。
+	v.Call = nil
 	if !a.hasReturn {
 		a.returnVals[i] = v
 	} else {

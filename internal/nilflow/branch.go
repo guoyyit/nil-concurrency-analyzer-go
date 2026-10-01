@@ -72,37 +72,91 @@ func refineEquality(st *flowState, n *ast.BinaryExpr, isEq, branch bool, info *t
 
 // bindEqNil：nilness 为真表示该分支上表达式为 nil。
 func bindEqNil(st *flowState, e ast.Expr, nilness bool, info *types.Info) {
-	// 先取出调用出处，再覆盖值，否则会丢失兄弟返回值的关联。
-	errRef := callRefOf(e, st, info)
 	if nilness {
 		setExprVal(st, e, vNil(), info)
-		// error 为 nil（成功）：精化同一调用的其他返回值为非 nil。
-		if isErrorExpr(e, info) && errRef != nil {
-			refineSiblingsByRef(st, errRef, true)
-		}
 	} else {
 		setExprVal(st, e, vNonNil(), info)
-		if isErrorExpr(e, info) && errRef != nil {
-			refineSiblingsByRef(st, errRef, false)
+	}
+	// err == nil / err != nil：绝不能由“错误为空”反推“数据非空”。
+	// 正确做法是按被调函数的返回路径过滤：只保留满足该 error 取值的路径，
+	// 再用这些路径上数据值的合并精化同一调用的兄弟结果。
+	if isErrorExpr(e, info) {
+		if ref := callRefOf(e, st, info); ref != nil {
+			refineSiblingsByError(st, ref, nilness)
 		}
 	}
 }
 
-// refineSiblingsByRef 根据兄弟 error 返回值的成功/失败，精化同一调用的其它结果。
-func refineSiblingsByRef(st *flowState, ref *CallRef, success bool) {
+// refineSiblingsByError 按 error 兄弟结果在本分支上的取值（nilness：
+// true=err 为 nil，false=err 非 nil）过滤被调函数返回路径，并据此
+// 精化同一调用产生的其它结果。
+func refineSiblingsByError(st *flowState, ref *CallRef, errIsNil bool) {
+	var definite, unresolved []ReturnPath
+	for _, p := range ref.Paths {
+		if ref.Idx >= len(p.Vals) {
+			continue
+		}
+		k := p.Vals[ref.Idx].Kind
+		if k == ValUnknown {
+			// error 来源无法确定的路径在两个分支上都可能可达。
+			unresolved = append(unresolved, p)
+			continue
+		}
+		if errIsNil == (k == ValNil) {
+			definite = append(definite, p)
+		}
+	}
+	// 优先使用静态确定落在该分支的路径（这是收紧的依据）；
+	// 只有不存在任何确定路径时，才把无法判定 error 的路径视为可达，
+	// 避免用失败/成功分支的确定数据污染另一侧结论（宁可沉默，不可滥报）。
+	matches := definite
+	if len(matches) == 0 {
+		matches = unresolved
+	}
 	for obj, v := range st.vars {
 		if v.Call != nil && v.Call.Expr == ref.Expr && v.Call.Idx != ref.Idx {
-			if success {
-				if v.Kind != ValNonNil {
-					st.vars[obj] = Val{Kind: ValNonNil, Call: v.Call}
-				}
-			} else {
-				// 失败分支：仅当来源静态未知时才下降为可能 nil。
-				if v.Kind == ValUnknown {
-					st.vars[obj] = Val{Kind: ValMaybeNil, Call: v.Call}
-				}
-			}
+			refineSiblingOnPaths(st, obj, v, matches)
 		}
+	}
+}
+
+type pathPred func(ReturnPath) bool
+
+func filterPaths(paths []ReturnPath, pred pathPred) []ReturnPath {
+	var out []ReturnPath
+	for _, p := range paths {
+		if pred(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// refineSiblingOnPaths 用过滤后的返回路径合并值精化兄弟结果；
+// 无路径信息（外部调用/递归未知）时保持原状，宁可沉默也不臆断非空。
+func refineSiblingOnPaths(st *flowState, obj interface{}, v Val, paths []ReturnPath) {
+	if len(paths) == 0 {
+		return
+	}
+	var joined Val
+	found := false
+	for _, p := range paths {
+		if v.Call.Idx >= len(p.Vals) {
+			continue
+		}
+		np := p.Vals[v.Call.Idx]
+		np.Call = v.Call
+		if !found {
+			joined = np
+			found = true
+		} else {
+			joined = joinVal(joined, np)
+		}
+	}
+	// 分支条件把可达路径过滤为子集，直接用子集合并值替换是合法的收紧；
+	// 无子集匹配（该分支静态不可达）时保持原状，不做推断。
+	if found {
+		st.vars[obj] = joined
 	}
 }
 
@@ -115,42 +169,63 @@ func refineBoolIdent(st *flowState, id *ast.Ident, branch bool, info *types.Info
 	if !ok {
 		return
 	}
-	if v.Call == nil {
-		// 普通布尔变量：条件为真不带来空值信息。
-		return
+	ref := v.Call
+	want := TruthTrue
+	if !branch {
+		want = TruthFalse
 	}
-	// ok 来源于 type assertion / channel receive / map index：
-	// 这些场景 ok==true 蕴含主结果非 nil（map 除外，但 map 值已为 Unknown，不强转）。
-	if branch {
-		ref := v.Call
-		for o, w := range st.vars {
-			if w.Call != nil && w.Call.Expr == ref.Expr && w.Call.Idx != ref.Idx &&
-				w.Kind == ValUnknown && isOkSource(ref.Expr, ref.Idx) {
-				st.vars[o] = Val{Kind: ValNonNil, Call: w.Call}
+	if ref != nil {
+		switch ref.Expr.(type) {
+		case *ast.CallExpr:
+			// ok 来源于函数调用（含多层包装）：按返回路径上的布尔真假过滤。
+			var definite, unresolved []ReturnPath
+			for _, p := range ref.Paths {
+				if ref.Idx >= len(p.Truths) {
+					continue
+				}
+				switch p.Truths[ref.Idx] {
+				case want:
+					definite = append(definite, p)
+				case TruthUnknown:
+					unresolved = append(unresolved, p)
+				}
+			}
+			// 确定路径优先；无确定匹配时才保留真假未知的路径。
+			matches := definite
+			if len(matches) == 0 {
+				matches = unresolved
+			}
+			for o, w := range st.vars {
+				if w.Call != nil && w.Call.Expr == ref.Expr && w.Call.Idx != ref.Idx {
+					refineSiblingOnPaths(st, o, w, matches)
+				}
+			}
+		default:
+			// 内置 (value, ok) 形式：type assertion / channel receive / map index。
+			// ok==true 蕴含主结果非 nil（map 值静态为 Unknown，精化仅消除误报）；
+			// 保护严格限定为同一次表达式产生的主结果，绝不牵连其它值。
+			if branch {
+				refineBuiltinOkSibling(st, ref.Expr, ref.Idx)
 			}
 		}
 	}
 }
 
-// isOkSource 判断某结果是否为“value, ok”二元形式的 ok 下标（下标 1），
-// 且主结果来自类型断言或通道接收（map 不蕴含非 nil）。
-func isOkSource(call ast.Expr, okIdx int) bool {
-	if okIdx != 1 {
-		return false
-	}
-	switch call.(type) {
-	case *ast.TypeAssertExpr:
-		return true
-	}
-	if u, ok := call.(*ast.UnaryExpr); ok && u.Op == token.ARROW {
-		return true
-	}
-	return false
-}
-
 func markNonNilIfError(st *flowState, e ast.Expr, info *types.Info) {
 	if isErrorExpr(e, info) {
 		setExprVal(st, e, vNonNil(), info)
+	}
+}
+
+// refineBuiltinOkSibling 将内置二元形式 ok==true 分支上的主结果精化为非 nil。
+// 保护严格限定为同一次表达式产生的主结果（Call.Expr 相同、Idx 不同）。
+func refineBuiltinOkSibling(st *flowState, src ast.Expr, okIdx int) {
+	for obj, w := range st.vars {
+		if w.Call != nil && w.Call.Expr == src && w.Call.Idx != okIdx {
+			if w.Kind == ValUnknown {
+				st.vars[obj] = Val{Kind: ValNonNil, Call: w.Call}
+			}
+		}
 	}
 }
 

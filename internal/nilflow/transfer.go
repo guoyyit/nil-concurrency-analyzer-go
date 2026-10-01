@@ -2,6 +2,7 @@ package nilflow
 
 import (
 	"go/ast"
+	"fmt"
 	"go/token"
 	"go/types"
 )
@@ -31,6 +32,7 @@ func (a *intraAnalyzer) transferAssign(n *ast.AssignStmt, st *flowState) *flowSt
 		vals := make([]Val, len(n.Rhs))
 		for i, r := range n.Rhs {
 			vals[i] = a.eval(r, st)
+			vals[i] = a.attachBoolTruth(vals[i], n.Lhs[i], r, st)
 		}
 		a.bindLHS(n.Lhs, vals, n.Tok == token.DEFINE, st)
 		a.checkLhsDeref(n.Lhs, st)
@@ -67,6 +69,20 @@ func (a *intraAnalyzer) bindLHS(lhs []ast.Expr, vals []Val, define bool, st *flo
 			st.exprs[l] = v
 		}
 	}
+}
+
+// attachBoolTruth 在左值为布尔变量且右值真假可静态判定时附加真值。
+func (a *intraAnalyzer) attachBoolTruth(v Val, lhs ast.Expr, rhs ast.Expr, st *flowState) Val {
+	id, ok := lhs.(*ast.Ident)
+	if !ok || id.Name == "_" {
+		return v
+	}
+	obj := a.info.ObjectOf(id)
+	if obj == nil || !isBoolType(obj.Type()) || v.Truth != TruthUnknown {
+		return v
+	}
+	v.Truth = a.truthOf(rhs, st)
+	return v
 }
 
 // checkLhsDeref 检查 *p = ... 与 p.f = ... 形式写入处的解引用。
