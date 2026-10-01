@@ -26,6 +26,8 @@ type Val struct {
 type CallRef struct {
 	Expr *ast.CallExpr
 	Idx  int
+	// Cond 是该返回值相对某个 error/ok 兄弟返回值的条件空值（来自被调摘要）。
+	Cond *SiblingCond
 }
 
 func vNil() Val     { return Val{Kind: ValNil} }
@@ -35,12 +37,26 @@ func vUnknown() Val { return Val{Kind: ValUnknown} }
 func (v Val) isNil() bool { return v.Kind == ValNil }
 
 // joinVal 是格上的最小上界。
+//
+// 关键约束（分支合并规则）：结论必须反映全部可达路径。只有所有可达路径
+// 都产生确定 nil 时，合并才允许是 ValNil；只要存在一条路径上的值可能非空
+// 或来源无法确定（ValUnknown），合并就必须降为 ValMaybeNil，绝不能把
+// “确定 nil”与“未知”合并后强化成确定 nil。
 func joinVal(x, y Val) Val {
 	if x.Kind == ValUnknown {
-		return y
+		// 未知 ⊔ 未知 仍是未知（保留后值出处）；未知 ⊔ 可能 nil 仍是可能 nil；
+		// 未知 ⊔ 确定 nil/非 nil：未知路径可能与确定路径相反，结论降为可能 nil，
+		// 绝不强化为确定值。
+		if y.Kind == ValUnknown || y.Kind == ValMaybeNil {
+			return y
+		}
+		return Val{Kind: ValMaybeNil}
 	}
 	if y.Kind == ValUnknown {
-		return x
+		if x.Kind == ValMaybeNil {
+			return x
+		}
+		return Val{Kind: ValMaybeNil}
 	}
 	if x.Kind == y.Kind {
 		if x.Call == y.Call {
@@ -49,6 +65,10 @@ func joinVal(x, y Val) Val {
 		// 来源不同，合并后保留来源信息意义不大，按 Kind 处理。
 		return Val{Kind: x.Kind}
 	}
+	if x.Kind == ValMaybeNil || y.Kind == ValMaybeNil {
+		return Val{Kind: ValMaybeNil}
+	}
+	// ValNil ⊔ ValNonNil：部分路径为空、部分路径非空 -> 可能 nil。
 	return Val{Kind: ValMaybeNil}
 }
 

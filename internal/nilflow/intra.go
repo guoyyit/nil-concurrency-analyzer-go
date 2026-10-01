@@ -34,6 +34,10 @@ type intraAnalyzer struct {
 	// 当前函数结果：各 return 语句抽象值的合并。
 	returnVals []Val
 	hasReturn  bool
+	// returnTuples 记录每条 return 路径的完整返回值元组（保留返回值之间的关联），
+	// returnExprs 为对应的结果表达式（裸 return 时为 nil）。
+	returnTuples [][]Val
+	returnExprs  [][]ast.Expr
 	// resultOk 记录命名返回值，用于裸 return。
 	resultObjs []*types.Var
 }
@@ -102,10 +106,223 @@ func (a *intraAnalyzer) run() (*Summary, []diag.Diagnostic) {
 	sum := &Summary{
 		Func:        a.env.Func,
 		Results:     results,
+		SiblingCond: a.buildSiblingConds(sig),
 		DerefParams: dp,
 		DerefPos:    a.derefPos,
 	}
 	return sum, a.diags
+}
+
+// buildSiblingConds 汇总所有 return 路径，构建“error/ok 兄弟返回值取某真值时，
+// 数据返回值的空值”这一条件关联。只有全部可达路径被考虑，结论才不会被强化。
+func (a *intraAnalyzer) buildSiblingConds(sig *types.Signature) []SiblingCond {
+	if sig == nil || len(a.returnTuples) == 0 {
+		return nil
+	}
+	r := sig.Results()
+	n := r.Len()
+	if n < 2 {
+		return nil
+	}
+	// 找出作为条件的兄弟下标：error 或 bool。
+	type sib struct {
+		idx   int
+		isErr bool
+	}
+	var sibs []sib
+	for i := 0; i < n; i++ {
+		u := r.At(i).Type()
+		if named, ok := u.(*types.Named); ok {
+			if obj := named.Obj(); obj != nil && obj.Pkg() == nil && obj.Name() == "error" {
+				sibs = append(sibs, sib{idx: i, isErr: true})
+				continue
+			}
+		}
+		if b, ok := u.Underlying().(*types.Basic); ok && b.Kind() == types.Bool {
+			sibs = append(sibs, sib{idx: i, isErr: false})
+		}
+	}
+	if len(sibs) == 0 {
+		return nil
+	}
+	var conds []SiblingCond
+	for _, sb := range sibs {
+		for di := 0; di < n; di++ {
+			if di == sb.idx {
+				continue
+			}
+			// 仅对可能为 nil 的数据结果建立关联（标量类型解引用无意义）。
+			if !nillableType(r.At(di).Type()) {
+				continue
+			}
+			c := SiblingCond{ResultIdx: di, SibIdx: sb.idx, SibIsErr: sb.isErr}
+			active := false
+			for ti, tuple := range a.returnTuples {
+				if di >= len(tuple) || sb.idx >= len(tuple) {
+					continue
+				}
+				dv := stripCall(tuple[di])
+				t, f := a.returnSibTruth(tuple, a.returnExprs[ti], sb.idx)
+				if t {
+					c.addToBucket(true, dv)
+					c.HasTrue = true
+					active = true
+				}
+				if f {
+					c.addToBucket(false, dv)
+					c.HasFalse = true
+					active = true
+				}
+			}
+			if active {
+				c.finishBuckets()
+				conds = append(conds, c)
+			}
+		}
+	}
+	return conds
+}
+
+// returnSibTruth 判断单条 return 路径上兄弟返回值的真假归属。
+// 返回 (canBeTrue, canBeFalse)；无法确定时两者皆真（保守覆盖两侧）。
+func (a *intraAnalyzer) returnSibTruth(tuple []Val, exprs []ast.Expr, sibIdx int) (bool, bool) {
+	v := tuple[sibIdx]
+	// error 结果的空值格信息最可靠：显式 nil/非 nil 字面量直接决定真假。
+	if sibIsError(a.env.Func, sibIdx) {
+		switch v.Kind {
+		case ValNil:
+			return false, true
+		case ValNonNil:
+			return true, false
+		}
+	}
+	// 多值透传调用：直接采用被调函数给出的条件结构。
+	if len(exprs) == 1 && sibIdx < len(tuple) {
+		if ref := tuple[sibIdx].Call; ref != nil && ref.Cond != nil {
+			return ref.Cond.HasTrue, ref.Cond.HasFalse
+		}
+	}
+	var e ast.Expr
+	if sibIdx < len(exprs) {
+		e = exprs[sibIdx]
+	}
+	if e != nil {
+		switch tv := staticBoolTruth(e, a.info); tv {
+		case 1:
+			return true, false
+		case -1:
+			return false, true
+		}
+	}
+	// bool 结果的空值格不表达真假（bool 非 nil 类型时甚至不进格），
+	// 无法确定时保守覆盖两侧。
+	return true, true
+}
+
+// sibIsError 判断某函数结果下标是否为内建 error 类型。
+func sibIsError(fn *types.Func, idx int) bool {
+	sig, ok := fn.Type().(*types.Signature)
+	if !ok {
+		return false
+	}
+	r := sig.Results()
+	if idx >= r.Len() {
+		return false
+	}
+	named, ok := r.At(idx).Type().(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := named.Obj()
+	return obj.Pkg() == nil && obj.Name() == "error"
+}
+
+// addToBucket 把一条可达返回路径上的数据空值并入指定真值桶。
+func (c *SiblingCond) addToBucket(truth bool, v Val) {
+	if truth {
+		if !c.HasTrue {
+			c.WhenTrue = v
+		} else {
+			c.WhenTrue = joinVal(c.WhenTrue, v)
+		}
+		if v.Kind == ValNil {
+			c.trueNil = true
+		}
+		return
+	}
+	if !c.HasFalse {
+		c.WhenFalse = v
+	} else {
+		c.WhenFalse = joinVal(c.WhenFalse, v)
+	}
+	if v.Kind == ValNil {
+		c.falseNil = true
+	}
+}
+
+// finishBuckets 在汇总全部可达返回路径后收尾：
+//   - 不可达真值桶：error!=nil 不可达时标记非 nil（该分支不会进入，避免
+//     失败保护后误报）；其余不可达桶保持未知；
+//   - error!=nil 桶仅因混入来源未知（Unknown）而成为 MaybeNil、且没有任何
+//     确定 nil 失败路径时，收敛为非 nil；存在真实 nil 失败路径则保留
+//     （失败分支内的解引用仍须报告）。
+func (c *SiblingCond) finishBuckets() {
+	if !c.HasTrue {
+		if c.SibIsErr {
+			c.WhenTrue = Val{Kind: ValNonNil}
+		} else {
+			c.WhenTrue = Val{Kind: ValUnknown}
+		}
+	}
+	if !c.HasFalse {
+		if c.SibIsErr {
+			c.WhenFalse = Val{Kind: ValNonNil}
+		} else {
+			c.WhenFalse = Val{Kind: ValUnknown}
+		}
+	}
+	if c.SibIsErr && c.HasTrue && c.WhenTrue.Kind == ValMaybeNil && !c.trueNil {
+		c.WhenTrue = Val{Kind: ValNonNil}
+	}
+}
+
+// stripCall 返回去掉调用出处的空值（摘要内不保留跨轮 AST 指针）。
+func stripCall(v Val) Val { return Val{Kind: v.Kind} }
+
+// nillableType 判断类型的零值/取值是否可能为 nil。
+func nillableType(t types.Type) bool {
+	u := t
+	if n, ok := t.(*types.Named); ok {
+		u = n.Underlying()
+	}
+	switch u.(type) {
+	case *types.Pointer, *types.Slice, *types.Map, *types.Chan,
+		*types.Signature, *types.Interface, *types.TypeParam:
+		return true
+	}
+	return false
+}
+
+// staticBoolTruth 静态求值布尔常量表达式：1 恒真、-1 恒假、0 未知。
+func staticBoolTruth(e ast.Expr, info *types.Info) int {
+	switch n := e.(type) {
+	case *ast.Ident:
+		switch n.Name {
+		case "true":
+			return 1
+		case "false":
+			return -1
+		}
+	case *ast.ParenExpr:
+		return staticBoolTruth(n.X, info)
+	case *ast.UnaryExpr:
+		if n.Op == token.NOT {
+			if t := staticBoolTruth(n.X, info); t != 0 {
+				return -t
+			}
+		}
+	}
+	return 0
 }
 
 // walkBlock 顺序执行一组语句，返回语句块结束后的状态；nil 表示不可达/已终止。
@@ -176,6 +393,9 @@ func (a *intraAnalyzer) walkIf(n *ast.IfStmt, st *flowState) *flowState {
 	if n.Init != nil {
 		st = a.walkStmt(n.Init, st)
 	}
+	// then/else 必须从条件前的同一状态各自独立精化派生：
+	// else 分支不能建立在 then 执行后的状态上，否则会把 then 分支对调用返回值
+	// 的条件精化错误带进 else（例如失败分支里残留成功分支的数据空值）。
 	thenSt := refineOnCond(st.clone(), n.Cond, true, a.info)
 	thenSt = a.walkBlock(n.Body, thenSt)
 	var elseSt *flowState
@@ -319,9 +539,12 @@ func (a *intraAnalyzer) walkStmtList(list []ast.Stmt, st *flowState) *flowState 
 func (a *intraAnalyzer) walkReturn(n *ast.ReturnStmt, st *flowState) *flowState {
 	if len(n.Results) == 0 {
 		// 裸 return：取命名返回值当前状态。
+		vals := make([]Val, len(a.resultObjs))
 		for i, v := range a.resultObjs {
+			vals[i] = st.vars[objectKey(v)]
 			a.mergeReturn(i, st.vars[objectKey(v)])
 		}
+		a.recordReturn(vals, nil)
 		a.hasReturn = true
 		return nil
 	}
@@ -331,14 +554,45 @@ func (a *intraAnalyzer) walkReturn(n *ast.ReturnStmt, st *flowState) *flowState 
 			for i, v := range vals {
 				a.mergeReturn(i, v)
 			}
+			exprs := make([]ast.Expr, len(vals))
+			for i := range vals {
+				exprs[i] = multiResultExpr(n.Results[0], i)
+			}
+			a.recordReturn(vals, exprs)
 			a.hasReturn = true
 			return nil
 		}
 	}
+	vals := make([]Val, len(n.Results))
 	for i, e := range n.Results {
-		a.mergeReturn(i, a.eval(e, st))
+		vals[i] = a.eval(e, st)
+		a.mergeReturn(i, vals[i])
 	}
+	a.recordReturn(vals, n.Results)
 	a.hasReturn = true
+	return nil
+}
+
+// recordReturn 保存一条返回路径上的完整结果元组。
+func (a *intraAnalyzer) recordReturn(vals []Val, exprs []ast.Expr) {
+	a.returnTuples = append(a.returnTuples, append([]Val(nil), vals...))
+	a.returnExprs = append(a.returnExprs, append([]ast.Expr(nil), exprs...))
+}
+
+// multiResultExpr 返回多值表达式第 idx 个结果对应的表达式，供返回值真值判定。
+// 对调用表达式直接复用调用节点（真实真假取自摘要条件）；其余内建多值形式
+// （map 索引/类型断言/通道接收）结果真假无法静态确定，返回 nil。
+func multiResultExpr(e ast.Expr, idx int) ast.Expr {
+	if idx != 1 {
+		// 主结果通常不是 bool/error；调用场景仍由元组 Call 条件处理。
+		if _, ok := e.(*ast.CallExpr); ok {
+			return e
+		}
+		return nil
+	}
+	if _, ok := e.(*ast.CallExpr); ok {
+		return e
+	}
 	return nil
 }
 

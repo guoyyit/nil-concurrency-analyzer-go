@@ -21,11 +21,38 @@ type Summary struct {
 	Results []Val // 每个返回值的空值抽象
 	// ResultPos 记录每个返回值被判定为 nil/非nil 的代表性 return 位置。
 	ResultPos []token.Pos
+	// SiblingCond 记录返回值之间的条件空值关联：
+	// 当第 SibIdx 个返回值（error 或 bool）为真/为假时，第 i 个数据结果的空值。
+	// 仅在被条件兄弟（error/ok 惯用法）切分后仍有意义时填充。
+	SiblingCond []SiblingCond
 	// DerefParams 记录函数体内无条件解引用的形参下标（接收者为 0）。
 	DerefParams []int
 	// DerefPos 给出各 DerefParams 解引用点的位置，用于调用路径展示。
 	DerefPos map[int]token.Pos
 	BodyHash string
+}
+
+// SiblingCond 描述“在第 SibIdx 个返回值取某个真值时，结果 ResultIdx 的空值”。
+type SiblingCond struct {
+	ResultIdx int
+	SibIdx    int
+	SibIsErr  bool // 兄弟返回值是否为 error（否则为 bool ok）
+	WhenTrue  Val  // 兄弟为真（err != nil / ok == true）时数据的空值
+	WhenFalse Val  // 兄弟为假（err == nil / ok == false）时数据的空值
+	HasTrue   bool // 是否存在兄弟为真的可达返回路径
+	HasFalse  bool // 是否存在兄弟为假的可达返回路径
+	trueNil   bool // true 桶中是否出现过确定 nil
+	falseNil  bool // false 桶中是否出现过确定 nil
+}
+
+// condLookup 在条件摘要表中查找 (resultIdx, sibIdx) 关联。
+func condLookup(conds []SiblingCond, resultIdx, sibIdx int) *SiblingCond {
+	for i := range conds {
+		if conds[i].ResultIdx == resultIdx && conds[i].SibIdx == sibIdx {
+			return &conds[i]
+		}
+	}
+	return nil
 }
 
 // FuncEnv 是分析单个函数时所需的环境。

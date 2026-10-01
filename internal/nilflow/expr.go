@@ -215,12 +215,24 @@ func (a *intraAnalyzer) evalCallMulti(call *ast.CallExpr, st *flowState) ([]Val,
 		out[i] = vUnknown()
 		if sum != nil && i < len(sum.Results) {
 			v := sum.Results[i]
-			// 标记调用出处，供 error-ok 条件精化。
-			v.Call = &CallRef{Expr: call, Idx: i}
+			// 标记调用出处及相对 error/ok 兄弟返回值的条件空值，供条件精化。
+			v.Call = &CallRef{Expr: call, Idx: i, Cond: condFor(sum.SiblingCond, i)}
 			out[i] = v
 		}
 	}
 	return out, true
+}
+
+// condFor 返回结果 resultIdx 关联的全部兄弟条件（同一数据可能对应多个兄弟）。
+// CallRef 只携带单个指针，因此这里只保留最常用的 error/首个 bool 关联。
+func condFor(conds []SiblingCond, resultIdx int) *SiblingCond {
+	for i := range conds {
+		if conds[i].ResultIdx == resultIdx {
+			c := conds[i]
+			return &c
+		}
+	}
+	return nil
 }
 
 // checkPtrDeref 根据解引用点的空值状态产出诊断或证据。

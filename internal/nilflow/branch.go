@@ -76,31 +76,79 @@ func bindEqNil(st *flowState, e ast.Expr, nilness bool, info *types.Info) {
 	errRef := callRefOf(e, st, info)
 	if nilness {
 		setExprVal(st, e, vNil(), info)
-		// error 为 nil（成功）：精化同一调用的其他返回值为非 nil。
+		// error 为 nil（成功）：按摘要中的条件空值精化同一调用的其他返回值，
+		// 不再无条件假设数据非 nil。
 		if isErrorExpr(e, info) && errRef != nil {
-			refineSiblingsByRef(st, errRef, true)
+			refineSiblingsByCond(st, errRef, false)
 		}
 	} else {
 		setExprVal(st, e, vNonNil(), info)
 		if isErrorExpr(e, info) && errRef != nil {
-			refineSiblingsByRef(st, errRef, false)
+			refineSiblingsByCond(st, errRef, true)
 		}
 	}
 }
 
-// refineSiblingsByRef 根据兄弟 error 返回值的成功/失败，精化同一调用的其它结果。
-func refineSiblingsByRef(st *flowState, ref *CallRef, success bool) {
+// sameCallRef 判断两个调用出处是否指向同一次调用的（可能不同下标的）结果。
+// CallRef 在绑定/读取时会产生不同副本，不能用指针相等比较。
+func sameCallRef(a, b *CallRef) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return a.Expr == b.Expr
+}
+
+// siblingCondFor 返回某调用结果相对指定兄弟下标的条件摘要；wantErr 限定
+// 兄弟必须是 error（true）或 bool（false）。
+func siblingCondFor(call *CallRef, sibIdx int, wantErr bool) *SiblingCond {
+	if call == nil || call.Cond == nil {
+		return nil
+	}
+	c := call.Cond
+	if c.SibIdx == sibIdx && c.SibIsErr == wantErr {
+		return c
+	}
+	return nil
+}
+
+// refineSiblingsByCond 根据兄弟 error 在本分支的真假，按被调函数摘要给出的
+// 条件空值精化同一调用的其它结果：
+//   - err == nil（success 分支）：采用 WhenFalse。所有成功路径数据都为 nil 时
+//     得到确定 nil，部分路径为 nil 时得到可能 nil，来源未知则保持未知；
+//   - err != nil（failure 分支）：采用 WhenTrue。没有真实 nil 失败路径时，
+//     摘要已将其收敛为非 nil，从而不把受保护的解引用误报为缺陷。
+func refineSiblingsByCond(st *flowState, ref *CallRef, errIsNonNil bool) {
+	var fallback Val
+	haveFallback := false
+	if ref.Cond != nil && ref.Cond.SibIsErr {
+		fallback = ref.Cond.WhenFalse
+		haveFallback = true
+		if errIsNonNil {
+			fallback = ref.Cond.WhenTrue
+		}
+	}
 	for obj, v := range st.vars {
-		if v.Call != nil && v.Call.Expr == ref.Expr && v.Call.Idx != ref.Idx {
-			if success {
-				if v.Kind != ValNonNil {
-					st.vars[obj] = Val{Kind: ValNonNil, Call: v.Call}
+		if v.Call != nil && sameCallRef(v.Call, ref) && v.Call.Idx != ref.Idx {
+			nv := v
+			// 为“该数据结果”选取它自己相对 error 兄弟的条件（被调摘要按
+			// (数据下标, 兄弟下标) 分别记录），不能复用 error 自身携带的 Cond。
+			if cd := siblingCondFor(v.Call, ref.Idx, true); cd != nil {
+				bucket := cd.WhenFalse
+				if errIsNonNil {
+					bucket = cd.WhenTrue
 				}
-			} else {
-				// 失败分支：仅当来源静态未知时才下降为可能 nil。
+				nv = Val{Kind: bucket.Kind, Call: v.Call}
+			} else if haveFallback {
+				nv = Val{Kind: fallback.Kind, Call: v.Call}
+			} else if errIsNonNil {
+				// 无摘要（外部/递归函数）：失败分支仅把来源未知降为可能 nil。
 				if v.Kind == ValUnknown {
-					st.vars[obj] = Val{Kind: ValMaybeNil, Call: v.Call}
+					nv = Val{Kind: ValMaybeNil, Call: v.Call}
 				}
+			}
+			// 无摘要的成功分支：保持原值，绝不凭空推断数据非 nil。
+			if nv.Kind != v.Kind {
+				st.vars[obj] = nv
 			}
 		}
 	}
@@ -119,25 +167,59 @@ func refineBoolIdent(st *flowState, id *ast.Ident, branch bool, info *types.Info
 		// 普通布尔变量：条件为真不带来空值信息。
 		return
 	}
-	// ok 来源于 type assertion / channel receive / map index：
-	// 这些场景 ok==true 蕴含主结果非 nil（map 除外，但 map 值已为 Unknown，不强转）。
-	if branch {
-		ref := v.Call
-		for o, w := range st.vars {
-			if w.Call != nil && w.Call.Expr == ref.Expr && w.Call.Idx != ref.Idx &&
-				w.Kind == ValUnknown && isOkSource(ref.Expr, ref.Idx) {
-				st.vars[o] = Val{Kind: ValNonNil, Call: w.Call}
+	refineOkSiblings(st, v.Call, branch)
+}
+
+// refineOkSiblings 根据同一次调用的布尔 ok 在本分支的真假，精化其数据结果。
+// 保护只作用于同一次调用产生的数据（按 CallRef.Expr 匹配）：
+//   - 调用带摘要（函数返回 (value, ok)）：ok==true 采用 WhenTrue。
+//     若 true 路径可能返回 nil 数据，则保留可能 nil（仍会报告）；
+//     来源未知时按 ok 惯用法精化为非 nil（受保护使用，不报告，可通过证据查看）。
+//     ok==false 分支采用 WhenFalse；
+//   - 内建 value,ok（类型断言/通道接收；map 值不蕴含非 nil，保守保留）：
+//     沿用原语义，ok==true 把来源未知的数据精化为非 nil。
+func refineOkSiblings(st *flowState, ref *CallRef, okIsTrue bool) {
+	for o, w := range st.vars {
+		if w.Call == nil || w.Call.Expr != ref.Expr || w.Call.Idx == ref.Idx {
+			continue
+		}
+		var nv Val
+		if cd := siblingCondFor(w.Call, ref.Idx, false); cd != nil {
+			bucket := cd.WhenFalse
+			if okIsTrue {
+				bucket = cd.WhenTrue
 			}
+			switch bucket.Kind {
+			case ValNil:
+				// 即便 ok 为真也确定返回 nil：按规则作为可能 nil 报告，
+				// 不静默（“ok 为真仍可能为空数据时应报告”）。
+				nv = Val{Kind: ValMaybeNil, Call: w.Call}
+			case ValMaybeNil:
+				nv = Val{Kind: ValMaybeNil, Call: w.Call}
+			case ValNonNil:
+				nv = Val{Kind: ValNonNil, Call: w.Call}
+			default:
+				// 来源未知：受 ok 惯用法保护，精化为非 nil。
+				nv = Val{Kind: ValNonNil, Call: w.Call}
+			}
+		} else if okIsTrue && isOkBuiltinSource(ref.Expr) {
+			if w.Kind == ValUnknown {
+				nv = Val{Kind: ValNonNil, Call: w.Call}
+			} else {
+				nv = w
+			}
+		} else {
+			continue
+		}
+		if nv.Kind != w.Kind {
+			st.vars[o] = nv
 		}
 	}
 }
 
-// isOkSource 判断某结果是否为“value, ok”二元形式的 ok 下标（下标 1），
-// 且主结果来自类型断言或通道接收（map 不蕴含非 nil）。
-func isOkSource(call ast.Expr, okIdx int) bool {
-	if okIdx != 1 {
-		return false
-	}
+// isOkBuiltinSource 判断调用是否为“value, ok”内建形式（类型断言/通道接收）。
+// map 索引的 ok 不蕴含 value 非 nil，故不在此列。
+func isOkBuiltinSource(call ast.Expr) bool {
 	switch call.(type) {
 	case *ast.TypeAssertExpr:
 		return true
